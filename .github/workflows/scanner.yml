@@ -2,7 +2,7 @@ name: Hourly Crypto Market Scanner
 
 on:
   schedule:
-    # Runs automatically at minute 0 of every hour (24/7 UTC)
+    # Runs automatically at minute 0 of every hour 24/7
     - cron: '0 * * * *'
   workflow_dispatch: # Allows manual triggering anytime
 
@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -29,3 +29,11 @@ jobs:
 
       - name: Run Option C Scan
         run: python bot_option_c_futures.py
+
+      - name: Upload Database Artifact
+        if: always() # Ensures database upload even if a bot scan fails
+        uses: actions/upload-artifact@v4
+        with:
+          name: crypto-trading-database
+          path: crypto_trading_data.db
+          retention-days: 7

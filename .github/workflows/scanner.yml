@@ -1,0 +1,31 @@
+name: Hourly Crypto Market Scanner
+
+on:
+  schedule:
+    # Runs automatically at minute 0 of every hour (24/7 UTC)
+    - cron: '0 * * * *'
+  workflow_dispatch: # Allows manual triggering anytime
+
+jobs:
+  run-scanners:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ccxt pandas numpy tradingview-screener
+
+      - name: Run Option A Scan
+        run: python bot_option_a_futures.py
+
+      - name: Run Option C Scan
+        run: python bot_option_c_futures.py

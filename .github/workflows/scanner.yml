@@ -10,6 +10,9 @@ jobs:
   run-scanners:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: write # Grants permission to push database commits back to repo
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -30,10 +33,9 @@ jobs:
       - name: Run Option C Scan
         run: python bot_option_c_futures.py
 
-      - name: Upload Database Artifact
-        if: always() # Ensures database is saved even if a scan returns no signals
-        uses: actions/upload-artifact@v4
-        with:
-          name: crypto-trading-database
-          path: crypto_trading_data.db
-          retention-days: 7
+      - name: Auto-Commit Database Changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add crypto_trading_data.db
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update crypto trading signals DB [skip ci]" && git push)

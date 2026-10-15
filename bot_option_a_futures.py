@@ -15,9 +15,9 @@ RISK_PER_TRADE = 0.02   # Risk 2% of free balance
 STOP_LOSS_PCT = 0.02    # 2% Stop Loss
 TAKE_PROFIT_PCT = 0.04  # 4% Take Profit
 
-ENABLE_LIVE_TRADING = False  # Set to True when ready for live execution
-API_KEY = ''                 # Your Binance Futures API Key
-SECRET_KEY = ''              # Your Binance Futures API Secret
+ENABLE_LIVE_TRADING = True
+API_KEY = 'YOUR_BINANCE_API_KEY'
+SECRET_KEY = 'YOUR_BINANCE_API_SECRET'
 DB_NAME = 'crypto_trading_data.db'
 # =================================================
 

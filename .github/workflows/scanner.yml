@@ -4,7 +4,7 @@ on:
   schedule:
     # Runs automatically at minute 0 of every hour 24/7
     - cron: '0 * * * *'
-  workflow_dispatch: # Allows manual triggering anytime
+  workflow_dispatch: # Allows manual trigger anytime
 
 jobs:
   run-scanners:
@@ -31,7 +31,7 @@ jobs:
         run: python bot_option_c_futures.py
 
       - name: Upload Database Artifact
-        if: always() # Ensures database upload even if a bot scan fails
+        if: always() # Ensures database is saved even if a scan returns no signals
         uses: actions/upload-artifact@v4
         with:
           name: crypto-trading-database

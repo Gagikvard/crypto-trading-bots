@@ -6,8 +6,8 @@ import pandas as pd
 import numpy as np
 
 # ================= CONFIGURATION =================
-LOOKBACK = 50            # Window for Mean & Standard Deviation
-Z_ENTRY_THRESHOLD = 1.8  # Signal threshold
+LOOKBACK = 50            # Window for Option A Mean & Standard Deviation
+Z_ENTRY_THRESHOLD = 1.8  # Option A Signal threshold
 SYMBOL_LIMIT = 50        # Perpetual contracts to scan
 TIMEFRAME = '1h'        
 LEVERAGE = 5             # 5x Leverage
@@ -15,38 +15,43 @@ RISK_PER_TRADE = 0.02    # Risk 2% of account balance per trade
 STOP_LOSS_PCT = 0.02     # 2% Stop Loss
 TAKE_PROFIT_PCT = 0.04   # 4% Take Profit
 
+# OPTION C CONFIGURATION (BREAKOUT ENGINE)
+VOLUME_MA_LOOKBACK = 20  # Moving average period for volume
+VOLUME_MULTIPLE = 2.5    # Volume surge threshold (2.5x normal volume)
+
 INITIAL_PAPER_BALANCE = 10000.0  # Starting Virtual USD Balance
 DB_NAME = 'crypto_paper_trading.db'
 # =================================================
 
-class PaperFuturesQuantitativeBot:
+class DualStrategyFuturesBot:
     def __init__(self):
-        # Public market data initialization (No API Key Required)
         config = {'enableRateLimit': True, 'options': {'defaultType': 'future'}}
         self.exchange = ccxt.binance(config)
         self.init_db()
 
     def init_db(self):
-        """Initializes SQLite database for signals, paper trades, and portfolio tracking."""
+        """Initializes SQLite tables for Option A, Option C, and paper trading."""
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         
-        # 1. Signals Log
+        # Signals Logs
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS option_a_signals (
+            CREATE TABLE IF NOT EXISTS strategy_signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT,
+                strategy TEXT, -- 'OPTION_A' or 'OPTION_C'
                 symbol TEXT,
                 price REAL,
-                z_score REAL,
+                metric_val REAL,
                 signal_type TEXT
             )
         ''')
 
-        # 2. Paper Trades Table (Active & Closed Positions)
+        # Paper Trades Table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS paper_trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                strategy TEXT,
                 symbol TEXT,
                 side TEXT,
                 entry_price REAL,
@@ -60,7 +65,7 @@ class PaperFuturesQuantitativeBot:
             )
         ''')
 
-        # 3. Paper Account Balance Table
+        # Paper Portfolio Table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS paper_portfolio (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,7 +88,6 @@ class PaperFuturesQuantitativeBot:
         conn.close()
 
     def get_portfolio_state(self):
-        """Fetches current cash balance and calculate equity."""
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute("SELECT cash_balance FROM paper_portfolio ORDER BY id DESC LIMIT 1")
@@ -98,17 +102,39 @@ class PaperFuturesQuantitativeBot:
                 return None
             
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            
+            # --- OPTION A CALCULATIONS (Z-Score) ---
             rolling_mean = df['close'].rolling(LOOKBACK).mean()
             rolling_std = df['close'].rolling(LOOKBACK).std()
-            
             latest_std = rolling_std.iloc[-1]
-            if latest_std == 0 or np.isnan(latest_std):
-                return None
-
             latest_close = df['close'].iloc[-1]
-            z_score = (latest_close - rolling_mean.iloc[-1]) / latest_std
+            
+            z_score = 0.0
+            if latest_std > 0 and not np.isnan(latest_std):
+                z_score = (latest_close - rolling_mean.iloc[-1]) / latest_std
 
-            return {'symbol': symbol, 'price': latest_close, 'z_score': round(z_score, 4)}
+            # --- OPTION C CALCULATIONS (Volume Breakout) ---
+            vol_ma = df['volume'].rolling(VOLUME_MA_LOOKBACK).mean().iloc[-1]
+            latest_vol = df['volume'].iloc[-1]
+            vol_ratio = (latest_vol / vol_ma) if vol_ma > 0 else 0.0
+
+            period_high = df['high'].iloc[-21:-1].max()
+            period_low = df['low'].iloc[-21:-1].min()
+
+            option_c_signal = None
+            if vol_ratio >= VOLUME_MULTIPLE:
+                if latest_close > period_high:
+                    option_c_signal = 'LONG'
+                elif latest_close < period_low:
+                    option_c_signal = 'SHORT'
+
+            return {
+                'symbol': symbol,
+                'price': latest_close,
+                'z_score': round(z_score, 4),
+                'vol_ratio': round(vol_ratio, 2),
+                'option_c_signal': option_c_signal
+            }
         except Exception:
             return None
 
@@ -123,92 +149,65 @@ class PaperFuturesQuantitativeBot:
         raw_results = await asyncio.gather(*tasks)
         return pd.DataFrame([r for r in raw_results if r is not None])
 
-    def log_signals_to_db(self, df: pd.DataFrame):
+    def process_paper_orders(self, df: pd.DataFrame):
         if df.empty:
             return
-        conn = sqlite3.connect(DB_NAME)
-        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
-        df_copy = df.copy()
-        df_copy['timestamp'] = timestamp
-        df_copy['signal_type'] = np.where(df_copy['z_score'] <= -Z_ENTRY_THRESHOLD, 'LONG', 'SHORT')
-        
-        db_df = df_copy[['timestamp', 'symbol', 'price', 'z_score', 'signal_type']]
-        db_df.to_sql('option_a_signals', conn, if_exists='append', index=False)
-        conn.close()
 
-    def process_paper_orders_and_pnl(self, current_prices: dict, signals_df: pd.DataFrame):
-        """Executes simulated purchases, monitors active trades for SL/TP, and updates PnL."""
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
 
-        # 1. Fetch current open paper positions
+        # 1. Fetch current open positions
         cursor.execute("SELECT id, symbol, side, entry_price, amount FROM paper_trades WHERE status = 'OPEN'")
         open_positions = cursor.fetchall()
+        current_prices = dict(zip(df['symbol'], df['price']))
 
-        total_unrealized_pnl = 0.0
         cash_balance = self.get_portfolio_state()
+        total_unrealized_pnl = 0.0
 
-        # 2. Check open positions for Stop-Loss / Take-Profit exit triggers
+        # 2. Evaluate active positions for SL / TP
         for trade_id, symbol, side, entry_price, amount in open_positions:
             if symbol not in current_prices:
                 continue
 
             current_price = current_prices[symbol]
-            
-            # Compute price return percentage
-            if side == 'LONG':
-                pnl_pct = (current_price - entry_price) / entry_price
-            else:  # SHORT
-                pnl_pct = (entry_price - current_price) / entry_price
-
+            pnl_pct = (current_price - entry_price) / entry_price if side == 'LONG' else (entry_price - current_price) / entry_price
             unrealized_pnl = amount * entry_price * pnl_pct * LEVERAGE
             total_unrealized_pnl += unrealized_pnl
 
-            # Check SL / TP conditions
-            close_trade = False
-            if pnl_pct <= -STOP_LOSS_PCT:
-                print(f"[STOP LOSS TRIGGERED] Closing {side} on {symbol} at ${current_price:.4f} (PnL: ${unrealized_pnl:.2f})")
-                close_trade = True
-            elif pnl_pct >= TAKE_PROFIT_PCT:
-                print(f"[TAKE PROFIT TRIGGERED] Closing {side} on {symbol} at ${current_price:.4f} (PnL: ${unrealized_pnl:.2f})")
-                close_trade = True
-
-            if close_trade:
-                realized_pnl = unrealized_pnl
-                cash_balance += realized_pnl
+            if pnl_pct <= -STOP_LOSS_PCT or pnl_pct >= TAKE_PROFIT_PCT:
+                cash_balance += unrealized_pnl
                 cursor.execute('''
                     UPDATE paper_trades
                     SET exit_price = ?, realized_pnl = ?, status = 'CLOSED', exit_time = ?
                     WHERE id = ?
-                ''', (current_price, round(realized_pnl, 4), timestamp, trade_id))
+                ''', (current_price, round(unrealized_pnl, 4), timestamp, trade_id))
 
-        # 3. Process new entry signals (Avoid duplicate active entries for same symbol)
+        # 3. Process Signals for Option A and Option C
         cursor.execute("SELECT DISTINCT symbol FROM paper_trades WHERE status = 'OPEN'")
         active_symbols = {row[0] for row in cursor.fetchall()}
 
-        if not signals_df.empty:
-            for _, row in signals_df.iterrows():
-                symbol = row['symbol']
-                price = row['price']
-                z_score = row['z_score']
-                side = 'LONG' if z_score <= -Z_ENTRY_THRESHOLD else 'SHORT'
+        for _, row in df.iterrows():
+            symbol = row['symbol']
+            price = row['price']
+            
+            if symbol in active_symbols:
+                continue
 
-                if symbol in active_symbols:
-                    continue  # Already in an active trade for this symbol
+            # Option A Signal Check
+            if row['z_score'] <= -Z_ENTRY_THRESHOLD:
+                self._execute_paper_trade(cursor, 'OPTION_A', symbol, 'LONG', price, cash_balance, timestamp)
+                active_symbols.add(symbol)
+            elif row['z_score'] >= Z_ENTRY_THRESHOLD:
+                self._execute_paper_trade(cursor, 'OPTION_A', symbol, 'SHORT', price, cash_balance, timestamp)
+                active_symbols.add(symbol)
 
-                # Calculate trade position sizing (Risking 2% of account balance)
-                position_value = cash_balance * RISK_PER_TRADE * LEVERAGE
-                amount = position_value / price
+            # Option C Breakout Signal Check
+            if row['option_c_signal'] and symbol not in active_symbols:
+                self._execute_paper_trade(cursor, 'OPTION_C', symbol, row['option_c_signal'], price, cash_balance, timestamp)
+                active_symbols.add(symbol)
 
-                cursor.execute('''
-                    INSERT INTO paper_trades (symbol, side, entry_price, amount, leverage, status, entry_time)
-                    VALUES (?, ?, ?, ?, ?, 'OPEN', ?)
-                ''', (symbol, side, price, round(amount, 6), LEVERAGE, timestamp))
-
-                print(f"[PAPER {side} EXECUTED] {symbol} | Entry: ${price} | Position Size: ${position_value:.2f} | Z-Score: {z_score}")
-
-        # 4. Save updated portfolio state
+        # 4. Record Portfolio State
         total_equity = cash_balance + total_unrealized_pnl
         cursor.execute('''
             INSERT INTO paper_portfolio (timestamp, cash_balance, unrealized_pnl, total_equity)
@@ -218,34 +217,27 @@ class PaperFuturesQuantitativeBot:
         conn.commit()
         conn.close()
 
-        print(f"\n--- PORTFOLIO SUMMARY ---")
-        print(f"Cash Balance:   ${cash_balance:,.2f}")
-        print(f"Unrealized PnL: ${total_unrealized_pnl:,.2f}")
-        print(f"Total Equity:   ${total_equity:,.2f}\n")
+        print(f"Portfolio Equity: ${total_equity:,.2f} | Cash: ${cash_balance:,.2f} | Unrealized PnL: ${total_unrealized_pnl:,.2f}")
+
+    def _execute_paper_trade(self, cursor, strategy, symbol, side, price, balance, timestamp):
+        position_value = balance * RISK_PER_TRADE * LEVERAGE
+        amount = position_value / price
+        cursor.execute('''
+            INSERT INTO paper_trades (strategy, symbol, side, entry_price, amount, leverage, status, entry_time)
+            VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?)
+        ''', (strategy, symbol, side, price, round(amount, 6), LEVERAGE, timestamp))
+        print(f"[{strategy} {side} PAPER TRADE] {symbol} @ ${price} | Size: ${position_value:.2f}")
 
     async def run_once(self):
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Executing Quantitative Paper Scan...")
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Running Dual-Strategy Scan (Option A + Option C)...")
         try:
             df = await self.scan_market()
-            if df.empty:
-                print("No market data fetched.")
-                return
-
-            current_prices = dict(zip(df['symbol'], df['price']))
-            signals = df[(df['z_score'] <= -Z_ENTRY_THRESHOLD) | (df['z_score'] >= Z_ENTRY_THRESHOLD)]
-
-            # Log quantitative signals
-            if not signals.empty:
-                self.log_signals_to_db(signals)
-
-            # Run paper execution engine
-            self.process_paper_orders_and_pnl(current_prices, signals)
-
+            self.process_paper_orders(df)
         except Exception as e:
-            print(f"Execution Error: {e}")
+            print(f"Scan Error: {e}")
         finally:
             await self.exchange.close()
 
 if __name__ == '__main__':
-    bot = PaperFuturesQuantitativeBot()
+    bot = DualStrategyFuturesBot()
     asyncio.run(bot.run_once())
